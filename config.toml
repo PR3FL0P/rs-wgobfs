@@ -1,0 +1,8 @@
+[obfs]
+local_addr = "127.0.0.2:3000"
+fwd_addr = "127.0.0.2:3002"
+key = "example"
+[unobfs]
+local_addr = "127.0.0.1:3000"
+fwd_addr = "127.0.0.1:3001"
+key = "example"

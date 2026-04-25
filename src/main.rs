@@ -2,14 +2,17 @@ use std::collections::HashMap;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
+use std::thread::{self};
+
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::runtime::Runtime;
 
 use bytes::BytesMut;
-use pico_args;
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
+use toml;
 
 mod chacha;
 mod chacha_glue;
@@ -18,43 +21,35 @@ mod wgobfs;
 
 use crate::wgobfs::MAX_RND_LEN;
 use crate::wgobfs::{obfs_udp_payload, unobfs_udp_payload, ForwardState};
-
-const HELP: &str = "\
-USAGE:
-  rs-wgobfs [OPTIONS]
-
-OPTIONS:
-  -h, --help                          Print help information
-  -l or --listen <IP:Port>            Listen address:port
-  -f or --forward <IP|Hostname:Port>  Peer's address:port
-  -6                                  (Optional) Prefer IPv6 when connecting
-                                      to the forward Peer
-
-  -k or --key                         Shared secret (will be repeated or
-                                      truncated to 32 characters)
-
-  -m or --mode <obfs|unobfs>          Mode, either obfs or unobfs
-";
-
-#[derive(Copy, Clone)]
+use serde::Deserialize;
+#[derive(Copy, Clone, Debug, Deserialize)]
 enum OPMode {
     Obfs,
     UnObfs,
 }
-
+#[derive(Clone, Copy, Deserialize, Debug)]
 struct AppArgs {
     local_addr: SocketAddr,
     fwd_addr: SocketAddr,
     key: [u8; 32],
     obfs_mode: OPMode,
 }
-
+#[derive(Deserialize)]
+struct Peer {
+    local_addr: String,
+    fwd_addr: String,
+    key: String,
+}
+#[derive(Deserialize)]
+struct Config {
+    obfs: Option<Peer>,
+    unobfs: Option<Peer>,
+}
 fn parse_socket_addr(s: &str, prefer_v6: bool) -> Option<SocketAddr> {
     // without DNS
     if let Ok(addr) = s.parse::<SocketAddr>() {
         return Some(addr);
     }
-
     // use DNS
     let mut v4: Option<SocketAddr> = None;
     let mut v6: Option<SocketAddr> = None;
@@ -78,9 +73,7 @@ fn parse_socket_addr(s: &str, prefer_v6: bool) -> Option<SocketAddr> {
     }
 }
 
-async fn create_dual_stack_socket(
-    addr: SocketAddr,
-) -> std::io::Result<UdpSocket> {
+async fn create_dual_stack_socket(addr: SocketAddr) -> std::io::Result<UdpSocket> {
     // create a raw socket2 Socket
     let socket: Socket;
     if addr.is_ipv4() {
@@ -114,55 +107,6 @@ fn repeat_string_to_bytes(s: &str, len: usize) -> Vec<u8> {
     repeated.into_iter().take(len).collect()
 }
 
-fn parse_args() -> Result<AppArgs, pico_args::Error> {
-    let mut pargs = pico_args::Arguments::from_env();
-
-    if pargs.contains(["-h", "--help"]) {
-        print!("{}", HELP);
-        std::process::exit(0);
-    }
-
-    let local_str: String = pargs
-        .value_from_str("--listen")
-        .or_else(|_| pargs.value_from_str("-l"))?;
-    let remote_str: String = pargs
-        .value_from_str("--forward")
-        .or_else(|_| pargs.value_from_str("-f"))?;
-
-    let mode: String = pargs
-        .value_from_str("--mode")
-        .or_else(|_| pargs.value_from_str("-m"))?;
-
-    let key: String = pargs
-        .value_from_str("--key")
-        .or_else(|_| pargs.value_from_str("-k"))?;
-
-    let key32 = repeat_string_to_bytes(&key, 32);
-    let mut key_arr = [0u8; 32];
-    key_arr.copy_from_slice(&key32);
-
-    let prefer_v6: bool = pargs.contains("-6");
-    let args = AppArgs {
-        local_addr: parse_socket_addr(&local_str, false)
-            .expect("Failed to parse listening address"),
-        fwd_addr: parse_socket_addr(&remote_str, prefer_v6)
-            .expect("Failed to parse the remote address"),
-        key: key_arr,
-        obfs_mode: match mode.as_str() {
-            "obfs" => OPMode::Obfs,
-            "unobfs" => OPMode::UnObfs,
-            _ => {
-                eprintln!("Invalide --mode: {}", mode);
-                std::process::exit(1);
-            }
-        },
-    };
-
-    Ok(args)
-}
-
-type ClientMap = Arc<RwLock<HashMap<SocketAddr, Client>>>;
-
 struct Client {
     socket: Arc<UdpSocket>,
     handle: JoinHandle<()>,
@@ -176,18 +120,15 @@ impl Drop for Client {
     }
 }
 
+type ClientMap = Arc<RwLock<HashMap<SocketAddr, Client>>>;
+
 struct ClientWorker {
     listen_socket: Arc<UdpSocket>,
     recv_socket: Arc<UdpSocket>,
 }
 
 impl ClientWorker {
-    async fn run(
-        self,
-        client_addr: SocketAddr,
-        key: [u8; 32],
-        obfs_mode: OPMode,
-    ) {
+    async fn run(self, client_addr: SocketAddr, key: [u8; 32], obfs_mode: OPMode) {
         let mut buf = [0u8; 1500];
         loop {
             let n = self.recv_socket.recv(&mut buf).await.unwrap();
@@ -256,7 +197,10 @@ impl ForwardWorker {
 
 #[inline]
 fn epoch_now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
 }
 
 async fn clean_inactive_client(registry: ClientMap, timeout: u64) {
@@ -289,18 +233,47 @@ const SLAB_SIZE: usize = 1024 * 256;
 //   Gigabit network.
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> std::io::Result<()> {
-    let args = match parse_args() {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("Error: {}.", e);
-            std::process::exit(1);
-        }
-    };
+    let config = std::fs::read_to_string("config.toml")?;
 
-    let listener = Arc::new(create_dual_stack_socket(args.local_addr).await?);
+    let t1 = instanse_spawner(config.clone(), None, OPMode::Obfs);
+    let duration = std::time::Duration::from_millis(100);
+    let t2 = instanse_spawner(config, Some(duration), OPMode::UnObfs);
+
+    t1.join().unwrap();
+    t2.join().unwrap();
+    Ok(())
+}
+
+fn instanse_spawner(
+    s: String,
+    t: Option<std::time::Duration>,
+    mode: OPMode,
+) -> std::thread::JoinHandle<()> {
+    t.map(|d| thread::sleep(d));
+    thread::spawn(move || {
+        let args = match parse_args(&s, mode) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("Error: {}.", e);
+                std::process::exit(1);
+            }
+        };
+        let rt = Runtime::new().unwrap();
+        let _ = rt.block_on(async {
+            let listener = Arc::new(create_dual_stack_socket(args.local_addr).await?);
+            run_instanse(args, listener).await.expect("penis");
+            Ok::<(), std::io::Error>(())
+        });
+    })
+}
+
+async fn run_instanse(args: AppArgs, listener: Arc<UdpSocket>) -> std::io::Result<()> {
     println!("rs-wgobfs, a companion to the Linux kernel module xt_wgobfs");
     println!("  Listening on {}", args.local_addr);
-    println!("  Obfuscating and forwarding wireguard to {}", args.fwd_addr);
+    println!(
+        "  Obfuscating and forwarding wireguard to {}",
+        args.fwd_addr
+    );
 
     let mut global_buf = BytesMut::with_capacity(SLAB_SIZE);
     unsafe {
@@ -308,6 +281,7 @@ async fn main() -> std::io::Result<()> {
     }
 
     let client_map: ClientMap = Arc::new(RwLock::new(HashMap::new()));
+
     let timeout: u64 = 600;
     tokio::spawn(clean_inactive_client(Arc::clone(&client_map), timeout));
     loop {
@@ -352,11 +326,7 @@ async fn main() -> std::io::Result<()> {
             };
 
             // use handle to abort inactive clients
-            let handle = tokio::spawn(client_worker.run(
-                client_addr,
-                args.key,
-                args.obfs_mode,
-            ));
+            let handle = tokio::spawn(client_worker.run(client_addr, args.key, args.obfs_mode));
 
             let client = Client {
                 socket: s.clone(),
@@ -369,7 +339,35 @@ async fn main() -> std::io::Result<()> {
             fwd_socket = Some(s);
         };
 
-        let fwd_worker = ForwardWorker { fwd_socket: fwd_socket.unwrap() };
+        let fwd_worker = ForwardWorker {
+            fwd_socket: fwd_socket.unwrap(),
+        };
         tokio::spawn(fwd_worker.run(buf, len, args.key, args.obfs_mode));
     }
+}
+
+fn parse_args(s: &str, mode: OPMode) -> Result<AppArgs, pico_args::Error> {
+    let cfg: Config = toml::from_str(&s).expect("error parse config.toml");
+
+    let cfg = if matches!(mode, OPMode::Obfs) {
+        cfg.obfs.or(cfg.unobfs)
+    } else {
+        cfg.unobfs.or(cfg.obfs)
+    }
+    .ok_or(pico_args::Error::MissingArgument)?;
+
+    let key32 = repeat_string_to_bytes(&cfg.key, 32);
+    let mut key_arr = [0u8; 32];
+    key_arr.copy_from_slice(&key32);
+
+    let args = AppArgs {
+        local_addr: parse_socket_addr(&cfg.local_addr, false)
+            .expect("Failed to parse listening address"),
+        fwd_addr: parse_socket_addr(&cfg.fwd_addr, false)
+            .expect("Failed to parse the remote address"),
+        key: key_arr,
+        obfs_mode: mode,
+    };
+
+    Ok(args)
 }
